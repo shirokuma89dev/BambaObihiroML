@@ -1,0 +1,13 @@
+# 機械学習・データ操作
+pandas
+numpy
+scikit-learn
+lightgbm
+
+# スクレイピング・通信
+requests
+beautifulsoup4
+
+# ユーティリティ・環境設定
+python-dotenv
+tqdm
