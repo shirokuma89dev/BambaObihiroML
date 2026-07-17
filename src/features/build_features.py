@@ -36,6 +36,7 @@ FEATURE_COLS = [
     # --- 物理相互作用・調子・疲労・鞍上 ---
     "power_moisture_interaction", "sled_weight_moisture_interaction",
     "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
+    "sled_weight_relief", "jockey_moisture_specialist",
     # --- Eloレーティング / 補正タイム指数 ---
     "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
     "horse_speed_figure", "horse_speed_figure_zscore",
@@ -279,6 +280,7 @@ def engineer_features(df):
     # 乗り替わり勝負度合い (現在の騎手勝率 - 前走の騎手勝率)
     df["prev_jockey_win_rate"] = df.groupby("horse_name")["jockey_win_rate"].shift(1).fillna(GLOBAL_WIN_RATE)
     df["jockey_upgrade_factor"] = df["jockey_win_rate"] - df["prev_jockey_win_rate"]
+    df["jockey_moisture_specialist"] = df["jockey_win_rate"] * df["track_moisture_num"]
     
     # 調教師
     df["trainer_win_rate"] = df.groupby("trainer_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
@@ -295,6 +297,8 @@ def engineer_features(df):
     print("スピード指標・モメンタム・道悪巧者インデックスを生成中...")
     df["prev_sled_weight"] = df.groupby("horse_name")["sled_weight_num"].shift(1)
     df["sled_weight_change"] = (df["sled_weight_num"] - df["prev_sled_weight"]).fillna(0)
+    df["horse_past_3_avg_sled"] = df.groupby("horse_name")["sled_weight_num"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+    df["sled_weight_relief"] = (df["horse_past_3_avg_sled"] - df["sled_weight_num"]).fillna(0)
     
     df["prev_date"] = df.groupby("horse_name")["date"].shift(1)
     df["days_since_last_race"] = (df["date"] - df["prev_date"]).dt.days.fillna(14)
@@ -377,6 +381,7 @@ def engineer_features(df):
         "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
         "power_moisture_interaction", "sled_weight_moisture_interaction",
         "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
+        "sled_weight_relief", "jockey_moisture_specialist",
         "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
         "horse_speed_figure", "horse_speed_figure_zscore",
         "pop_is_fav", "pop_inv", "pop_zscore",
