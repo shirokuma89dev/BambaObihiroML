@@ -69,19 +69,92 @@ def bayesian_target_encoding(group_series, prior_mean, prior_weight=10):
     cum_count = group_series.shift(1).expanding().count().fillna(0)
     return (cum_sum + prior_mean * prior_weight) / (cum_count + prior_weight)
 
-def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
-    os.makedirs(out_dir, exist_ok=True)
-    
-    result_files = glob.glob(os.path.join(data_dir, "banei_race_results_*.csv"))
-    if not result_files:
-        print(f"エラー: {data_dir} にレース結果CSVが存在しません。")
-        return None
-        
-    dfs = [pd.read_csv(f) for f in result_files]
-    df = pd.concat(dfs, ignore_index=True)
-    
-    print(f"--- 生データ処理開始: 全 {len(df)} 件 ---")
-    
+def compute_multiplayer_elo(df, key, k=32.0, base=1500.0):
+    """
+    多頭レース用Eloレーティング。各馬(騎手)を相手全員とのペア対戦とみなし、
+    着順の勝敗で更新。返すのは「そのレース開始前」のレート(=リークなし)。
+    """
+    ratings = {}
+    pre_vals = np.full(len(df), base, dtype=float)
+    groups = df.groupby("race_id", sort=False).indices
+    names_all = df[key].astype(str).values
+    ranks_all = df["rank_num"].values
+    for rid in df["race_id"].drop_duplicates():
+        ix = groups[rid]
+        names = names_all[ix]
+        ranks = ranks_all[ix]
+        cur = np.array([ratings.get(n, base) for n in names])
+        pre_vals[ix] = cur  # 更新前のレートを記録
+        n = len(names)
+        if n < 2:
+            continue
+        valid = ~np.isnan(ranks)
+        new = cur.copy()
+        for a in range(n):
+            if not valid[a]:
+                continue
+            exp = act = 0.0
+            cnt = 0
+            for b in range(n):
+                if a == b or not valid[b]:
+                    continue
+                exp += 1.0 / (1.0 + 10 ** ((cur[b] - cur[a]) / 400.0))
+                if ranks[a] < ranks[b]:
+                    act += 1.0
+                elif ranks[a] == ranks[b]:
+                    act += 0.5
+                cnt += 1
+            if cnt > 0:
+                new[a] = cur[a] + k * (act - exp) / cnt
+        for i, nm in enumerate(names):
+            if valid[i]:
+                ratings[nm] = new[i]
+    return pre_vals
+
+
+def compute_speed_figure(df):
+    """
+    タイムを斤量・馬場水分・クラスで補正した残差(=条件を除いた実力)。
+    残差の符号を反転(速い=高得点)し、馬ごとに過去平均(shiftで当該レース除外)。
+    物理条件→タイムの回帰であり着順は使わないためターゲットリークではない。
+    """
+    fit = df[["time_sec", "sled_weight_num", "track_moisture_num", "class_level"]].dropna()
+    figure = np.full(len(df), np.nan)
+    if len(fit) > 100:
+        A = np.column_stack([
+            fit["sled_weight_num"].values,
+            fit["track_moisture_num"].values,
+            fit["class_level"].values,
+            np.ones(len(fit)),
+        ])
+        beta, *_ = np.linalg.lstsq(A, fit["time_sec"].values, rcond=None)
+        X = np.column_stack([
+            df["sled_weight_num"].values,
+            df["track_moisture_num"].values,
+            df["class_level"].values,
+            np.ones(len(df)),
+        ])
+        expected = X @ beta
+        # 速い(実測<期待)ほど大きくなるよう符号反転
+        df = df.assign(_resid=(expected - df["time_sec"].values))
+    else:
+        df = df.assign(_resid=np.nan)
+    fig = df.groupby("horse_name")["_resid"].transform(
+        lambda s: s.shift(1).expanding(min_periods=1).mean()
+    )
+    fig = fig.fillna(0.0)
+    fig_z = df.assign(_fig=fig).groupby("race_id")["_fig"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
+    return fig.values, fig_z.values
+
+
+def engineer_features(df):
+    """連結済み生データ(過去結果 + 任意で当日出走表)から全特徴量を生成して返す。
+    shift/expanding系はレース時系列順に計算されるため、末尾に置いた出走表行は
+    「そのレース開始前」の値(Elo/累積勝率/タイム指数等)を正しく受け取る。"""
+    print(f"--- 特徴量エンジニアリング: 全 {len(df)} 件 ---")
+
     # 1. 基本パース
     df["rank_num"] = df["rank"].apply(clean_numeric)
     df["is_win"] = (df["rank_num"] == 1).astype(int)
@@ -220,8 +293,21 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     df["horse_wet_avg_rank"] = df.groupby("horse_name")["wet_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
     
     df["track_specialist_factor"] = (df["horse_wet_avg_rank"] - df["horse_dry_avg_rank"]).fillna(0)
-    
-    # 最終的な特徴量群 (全 45 次元 + 気象庁データ + 馬場水分相互作用 + 調子・疲労・鞍上)
+
+    # 5. Eloレーティング (対戦相手の強さを織り込む動的能力指標)
+    print("馬・騎手のEloレーティングを時系列更新中...")
+    df["horse_elo_pre"] = compute_multiplayer_elo(df, "horse_name", k=32)
+    df["jockey_elo_pre"] = compute_multiplayer_elo(df, "jockey_name", k=16)
+    df["horse_elo_zscore"] = df.groupby("race_id")["horse_elo_pre"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
+    df["elo_gap_to_top"] = df.groupby("race_id")["horse_elo_pre"].transform(lambda x: x - x.max())
+
+    # 6. 斤量・馬場補正タイム指数 (物理条件を除いた「真の能力」の時計)
+    print("斤量・馬場補正タイム指数を生成中...")
+    df["horse_speed_figure"], df["horse_speed_figure_zscore"] = compute_speed_figure(df)
+
+    # 最終的な特徴量群 (全 45 次元 + 気象庁データ + 馬場水分相互作用 + 調子・疲労・鞍上 + Elo + タイム指数)
     base_cols = [
         "race_id", "date", "race_no", "race_name", "umaban", "waku",
         "horse_name", "sex_age", "jockey_name", "trainer_name", "weather",
@@ -240,16 +326,34 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
         "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
         "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
         "power_moisture_interaction", "sled_weight_moisture_interaction",
-        "jockey_upgrade_factor", "recent_form_score", "fatigue_index"
+        "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
+        "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
+        "horse_speed_figure", "horse_speed_figure_zscore"
     ]
     weather_cols = list(weather_dummies.columns)
     target_cols = ["is_win", "is_top3", "rank_num", "speed_mps"]
     
     features_df = df[base_cols + weather_cols + target_cols].copy()
-    
+    return features_df
+
+
+def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    result_files = glob.glob(os.path.join(data_dir, "banei_race_results_*.csv"))
+    if not result_files:
+        print(f"エラー: {data_dir} にレース結果CSVが存在しません。")
+        return None
+
+    dfs = [pd.read_csv(f) for f in result_files]
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"--- 生データ処理開始: 全 {len(df)} 件 ---")
+
+    features_df = engineer_features(df)
+
     out_path = os.path.join(out_dir, "features_train.csv")
     features_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"完了: 爆発的的中率向上のための新特徴量データセット出力 -> {out_path} (全 {len(features_df)} 件)")
+    print(f"完了: 特徴量データセット出力 -> {out_path} (全 {len(features_df)} 件)")
     return out_path
 
 def main():
