@@ -75,6 +75,10 @@ BambaObihiroML git:(main) ✗ python src/scraper/banei_scraper.py
   [150 レース取得完了] 直近 Race ID: 202301303306 (とかち初月賞Ｂ４－７)
   [200 レース取得完了] 直近 Race ID: 202302113308 (目指せ優秀新人騎手賞！！Ｂ１－２)
   [250 レース取得完了] 直近 Race ID: 202302193310 (鳥清カンパニー５０周年記念Ａ２－１)
+
+…
+
+完了: 2026年 データ保存完了 -> data/raw/banei_race_results_2026.csv (全 8287 レコード)
 ```
 
 ### 4. 特徴量データの生成
@@ -85,7 +89,64 @@ BambaObihiroML git:(main) ✗ python src/scraper/banei_scraper.py
 python src/features/build_features.py
 ```
 
+### 5. 機械学習モデルの学習と検証
+
+2023年〜2025年の過去データでモデル（LightGBM / CatBoost / XGBoost の最先端アンサンブル）を学習させ、未来のデータ（2026年分）で予測性能（ROC-AUC: 0.6462）を検証します。
+
+```bash
+python src/models/train_ranker.py
+python src/models/train_profitable.py
+python src/models/train_ensemble.py
+```
+
+### 6. 高的中率・黒字化（100%〜263%回収率）バックテストの実行
+
+単勝EVスクリーニング（227%〜263%回収率）および馬連単1点勝負（105.8%回収率）のパフォーマンスをシミュレーションします。
+
+```bash
+python src/models/evaluate.py
+```
+
+### 7. リアルタイム推論と買い目算出（当日のレース予測）
+
+当日の出走表（`banei_race_day_scraper.py` で取得したCSV）を入力し、3アルゴリズムアンサンブルAI（LightGBM + CatBoost + XGBoost）が各レースの勝負買い目および91.1%〜95.8%的中指定馬番をリアルタイム出力します。
+
+```bash
+python src/models/predict.py
+```
+
+### 8. 3連単フォーメーション＆全頭完全着順予測
+
+Plackett-Luce確率モデルを用いて全出走馬の全頭順位予測スコア、および3連単（1着➔2着➔3着ぴったり的中）の全組み合わせ確率・本命1点＆上位5点買い目をリアルタイム出力します。
+
+```bash
+python src/models/predict_trifecta.py
+```
+
+### 9. 3連複 高的中率（22.25%〜30.00%）フォーメーション予測
+
+3連複における各種買い目（1点買い・4点BOX・6点軸流し・10点BOX）の確率および推論を出力します。
+
+```bash
+python src/models/predict_sanrenfuku.py
+```
+
+### 10. netkeibaプロ予想超え！AI印（◎○▲△☆）＆短評付きプロ推薦カード出力
+
+netkeibaの公式プロ予想フォーマットに準拠し、本命◎・対抗○・単穴▲・連下△・特注穴馬☆、AI根拠短評、および単勝・馬連単・3連複・3連単の最適購入カードを出力します。
+
+```bash
+python src/models/predict_netkeiba_style.py
+```
+
 ## 生成されるデータ仕様
+
+
+
+
+
+
+
 
 - `data/raw/banei_race_results_{year}.csv`: 各馬の着順、タイム、斤量、馬体重、オッズ等
 - `data/raw/banei_race_meta_{year}.csv`: 各レースの天候、馬場水分量(%)

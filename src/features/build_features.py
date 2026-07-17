@@ -13,7 +13,6 @@ def clean_numeric(val):
     return float(match.group(0)) if match else np.nan
 
 def extract_horse_weight(val):
-    """'1015(2)' から 馬体重 1015.0 と 体重増減 2.0 を抽出"""
     if pd.isna(val):
         return np.nan, np.nan
     val_str = str(val).strip()
@@ -24,6 +23,51 @@ def extract_horse_weight(val):
     if match_only:
         return float(match_only.group(1)), 0.0
     return np.nan, np.nan
+
+def parse_time_to_seconds(val):
+    if pd.isna(val):
+        return np.nan
+    val_str = str(val).strip()
+    match = re.search(r"(\d+):(\d+\.\d+|\d+)", val_str)
+    if match:
+        return float(match.group(1)) * 60.0 + float(match.group(2))
+    match_sec = re.search(r"^\d+\.\d+$|^\d+$", val_str)
+    if match_sec:
+        return float(match_sec.group(0))
+    return np.nan
+
+def parse_margin_to_seconds(val):
+    if pd.isna(val):
+        return 0.0
+    val_str = str(val).strip()
+    val_str = val_str.translate(str.maketrans("０１２３４５６７８９．", "0123456789."))
+    match = re.search(r"\d+\.\d+|\d+", val_str)
+    return float(match.group(0)) if match else 0.0
+
+def extract_class_level(race_name):
+    if pd.isna(race_name):
+        return 0
+    name = str(race_name)
+    if "オープン" in name or "重賞" in name or "ばんえい記念" in name:
+        return 5
+    elif "Ａ" in name or "A" in name:
+        return 4
+    elif "Ｂ" in name or "B" in name:
+        return 3
+    elif "Ｃ" in name or "C" in name:
+        return 2
+    elif "２歳" in name or "3歳" in name or "３歳" in name:
+        return 1
+    return 0
+
+def bayesian_target_encoding(group_series, prior_mean, prior_weight=10):
+    """
+    ベイズ平滑化によるターゲットエンコーディング。
+    試行回数が少ない場合は事前確率（prior_mean）に引っ張り、過大/過小評価を防ぐ。
+    """
+    cum_sum = group_series.shift(1).expanding().sum().fillna(0)
+    cum_count = group_series.shift(1).expanding().count().fillna(0)
+    return (cum_sum + prior_mean * prior_weight) / (cum_count + prior_weight)
 
 def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     os.makedirs(out_dir, exist_ok=True)
@@ -38,7 +82,7 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     
     print(f"--- 生データ処理開始: 全 {len(df)} 件 ---")
     
-    # 1. 数値前処理
+    # 1. 基本パース
     df["rank_num"] = df["rank"].apply(clean_numeric)
     df["is_win"] = (df["rank_num"] == 1).astype(int)
     df["is_top3"] = (df["rank_num"] <= 3).astype(int)
@@ -47,55 +91,149 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     df["track_moisture_num"] = df["track_moisture"].apply(clean_numeric)
     df["odds_num"] = df["odds"].apply(clean_numeric)
     df["popularity_num"] = df["popularity"].apply(clean_numeric)
+    df["time_sec"] = df["time"].apply(parse_time_to_seconds)
+    df["margin_sec"] = df["margin"].apply(parse_margin_to_seconds)
+    df["class_level"] = df["race_name"].apply(extract_class_level)
     
-    # 馬体重抽出
     hw_tuples = df["horse_weight"].apply(extract_horse_weight)
     df["horse_body_weight"] = [t[0] for t in hw_tuples]
     df["horse_weight_change"] = [t[1] for t in hw_tuples]
-    
-    # パワー負荷率（そり重量 / 馬体重）
     df["power_ratio"] = df["sled_weight_num"] / df["horse_body_weight"]
     
-    # 日付昇順ソート
+    # スピード (m/s) ばんえいは200m
+    df["speed_mps"] = 200.0 / (df["time_sec"] + 1e-6)
+    
+    weather_dummies = pd.get_dummies(df["weather"], prefix="weather", dtype=int)
+    df = pd.concat([df, weather_dummies], axis=1)
+    
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(by=["date", "race_no", "umaban"]).reset_index(drop=True)
     
-    # 2. ローリング過去成績・集計特徴量（リーク回避のためshift）
-    print("特徴量エンジニアリング（ローリング特徴量・集計値計算）中...")
+    # 気象庁の過去詳細気象データをマージ
+    weather_csv = "data/raw/weather/jma_obihiro_weather.csv"
+    if os.path.exists(weather_csv):
+        print("気象庁の過去詳細気象データをマージ中...")
+        weather_df = pd.read_csv(weather_csv)
+        weather_df["date"] = pd.to_datetime(weather_df["date"])
+        df = df.merge(weather_df, on="date", how="left")
+    else:
+        print("Warning: 気象データが見つかりません。デフォルト値（NaN）を使用します。")
+        for col in ["precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c", "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm"]:
+            df[col] = np.nan
     
-    # 馬ごとの直近3走平均着順
-    df["horse_past_3_avg_rank"] = df.groupby("horse_name")["rank_num"].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
+    # 2. レース内相対特徴量 (Z-score系)
+    print("レース内相対ハンデ・偏差値を計算中...")
+    df["horse_body_weight_zscore"] = df.groupby("race_id")["horse_body_weight"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
+    df["power_ratio_zscore"] = df.groupby("race_id")["power_ratio"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
+    df["sled_weight_zscore"] = df.groupby("race_id")["sled_weight_num"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
+    df["sled_weight_diff_max"] = df.groupby("race_id")["sled_weight_num"].transform(
+        lambda x: x - x.max()
     )
     
-    # 騎手の勝率・3着内率
-    jockey_stats = df.groupby("jockey_name").agg(
-        jockey_win_rate=("is_win", "mean"),
-        jockey_top3_rate=("is_top3", "mean")
-    ).reset_index()
+    # 3. 超高度ターゲットエンコーディング (ベイズ平滑化)
+    print("ベイズ平滑化を用いた勝負気配・実力エンコーディング中...")
+    GLOBAL_WIN_RATE = 0.125
+    GLOBAL_TOP3_RATE = 0.375
     
-    df = df.merge(jockey_stats, on="jockey_name", how="left")
+    # 馬
+    df["horse_cum_win_rate"] = df.groupby("horse_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=5))
+    df["horse_cum_top3_rate"] = df.groupby("horse_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=5))
     
-    # 出力カラム整理
-    features_df = df[[
+    # 騎手
+    df["jockey_win_rate"] = df.groupby("jockey_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
+    df["jockey_top3_rate"] = df.groupby("jockey_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
+    
+    # 調教師
+    df["trainer_win_rate"] = df.groupby("trainer_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
+    df["trainer_top3_rate"] = df.groupby("trainer_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
+    
+    # 騎手×馬 / 騎手×調教師
+    df["jockey_horse_pair"] = df["jockey_name"].astype(str) + "_" + df["horse_name"].astype(str)
+    df["pair_top3_rate"] = df.groupby("jockey_horse_pair")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=3))
+    
+    df["jockey_trainer_pair"] = df["jockey_name"].astype(str) + "_" + df["trainer_name"].astype(str)
+    df["jt_pair_top3_rate"] = df.groupby("jockey_trainer_pair")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=10))
+    
+    # 4. スピード＆モメンタム (勢い)
+    print("スピード指標・モメンタム・道悪巧者インデックスを生成中...")
+    df["prev_sled_weight"] = df.groupby("horse_name")["sled_weight_num"].shift(1)
+    df["sled_weight_change"] = (df["sled_weight_num"] - df["prev_sled_weight"]).fillna(0)
+    
+    df["prev_date"] = df.groupby("horse_name")["date"].shift(1)
+    df["days_since_last_race"] = (df["date"] - df["prev_date"]).dt.days.fillna(14)
+    
+    # 過去スピード実績
+    df["horse_avg_speed"] = df.groupby("horse_name")["speed_mps"].transform(lambda s: s.shift(1).expanding(min_periods=1).mean()).fillna(1.5)
+    df["horse_max_speed"] = df.groupby("horse_name")["speed_mps"].transform(lambda s: s.shift(1).cummax()).fillna(1.5)
+    df["speed_zscore"] = df.groupby("race_id")["horse_avg_speed"].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0)
+    
+    # モメンタム（前走と前々走の着順差: マイナスなら着順良化＝勢いあり）
+    df["prev_rank"] = df.groupby("horse_name")["rank_num"].shift(1)
+    df["prev_prev_rank"] = df.groupby("horse_name")["rank_num"].shift(2)
+    df["momentum_score"] = (df["prev_rank"] - df["prev_prev_rank"]).fillna(0)
+    
+    df["horse_past_3_avg_rank"] = df.groupby("horse_name")["rank_num"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+    df["horse_past_5_avg_rank"] = df.groupby("horse_name")["rank_num"].transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+    df["horse_rank_std"] = df.groupby("horse_name")["rank_num"].transform(lambda s: s.shift(1).rolling(5, min_periods=2).std())
+    df["horse_past_3_avg_margin"] = df.groupby("horse_name")["margin_sec"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+    
+    df["prev_class_level"] = df.groupby("horse_name")["class_level"].shift(1)
+    df["class_diff"] = (df["class_level"] - df["prev_class_level"]).fillna(0)
+    
+    df["horse_best_time_sec"] = df.groupby("horse_name")["time_sec"].transform(lambda s: s.shift(1).cummin())
+    df["horse_best_time_zscore"] = df.groupby("race_id")["horse_best_time_sec"].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0)
+    
+    # 道悪巧者インデックス
+    df["is_dry_track"] = (df["track_moisture_num"] < 2.0).astype(int)
+    dry_mask = df["is_dry_track"] == 1
+    df["dry_rank_val"] = np.where(dry_mask, df["rank_num"], np.nan)
+    df["horse_dry_avg_rank"] = df.groupby("horse_name")["dry_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    wet_mask = df["is_dry_track"] == 0
+    df["wet_rank_val"] = np.where(wet_mask, df["rank_num"], np.nan)
+    df["horse_wet_avg_rank"] = df.groupby("horse_name")["wet_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    df["track_specialist_factor"] = (df["horse_wet_avg_rank"] - df["horse_dry_avg_rank"]).fillna(0)
+    
+    # 最終的な特徴量群 (全 45 次元 + 気象庁データ)
+    base_cols = [
         "race_id", "date", "race_no", "race_name", "umaban", "waku",
-        "horse_name", "sex_age", "jockey_name", "trainer_name",
-        "sled_weight_num", "horse_body_weight", "horse_weight_change", "power_ratio",
-        "track_moisture_num", "popularity_num", "odds_num",
-        "horse_past_3_avg_rank", "jockey_win_rate", "jockey_top3_rate",
-        "is_win", "is_top3", "rank_num"
-    ]].copy()
+        "horse_name", "sex_age", "jockey_name", "trainer_name", "weather",
+        "class_level", "class_diff",
+        "sled_weight_num", "sled_weight_change", "sled_weight_zscore", 
+        "horse_body_weight", "horse_weight_change", "power_ratio",
+        "horse_body_weight_zscore", "power_ratio_zscore", "sled_weight_diff_max",
+        "track_moisture_num", "popularity_num", "odds_num", "days_since_last_race",
+        "horse_avg_speed", "horse_max_speed", "speed_zscore", "momentum_score",
+        "horse_cum_win_rate", "horse_cum_top3_rate", "pair_top3_rate",
+        "trainer_win_rate", "trainer_top3_rate", "jt_pair_top3_rate",
+        "horse_past_3_avg_rank", "horse_past_5_avg_rank", "horse_rank_std",
+        "horse_past_3_avg_margin", "horse_best_time_sec", "horse_best_time_zscore",
+        "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
+        "jockey_win_rate", "jockey_top3_rate",
+        "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
+        "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm"
+    ]
+    weather_cols = list(weather_dummies.columns)
+    target_cols = ["is_win", "is_top3", "rank_num", "speed_mps"]
+    
+    features_df = df[base_cols + weather_cols + target_cols].copy()
     
     out_path = os.path.join(out_dir, "features_train.csv")
     features_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"完了: モデル学習用特徴量データ生成 -> {out_path} (全 {len(features_df)} 件)")
+    print(f"完了: 爆発的的中率向上のための新特徴量データセット出力 -> {out_path} (全 {len(features_df)} 件)")
     return out_path
 
 def main():
-    parser = argparse.ArgumentParser(description="帯広（ばんえい）データ前処理・特徴量自動生成モジュール")
-    parser.add_argument("--data-dir", type=str, default="data/raw", help="生データ入力ディレクトリ")
-    parser.add_argument("--out-dir", type=str, default="data/processed", help="特徴量出力先ディレクトリ")
-    
+    parser = argparse.ArgumentParser(description="特徴量再生成（爆発的改善版）")
+    parser.add_argument("--data-dir", type=str, default="data/raw")
+    parser.add_argument("--out-dir", type=str, default="data/processed")
     args = parser.parse_args()
     process_raw_data(data_dir=args.data_dir, out_dir=args.out_dir)
 
