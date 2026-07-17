@@ -5,6 +5,50 @@ import re
 import pandas as pd
 import numpy as np
 
+# ============================================================================
+# モデルが使用する特徴量の正規リスト。
+# engineer_features() が生成する列のうち、学習・推論の入力に使うものを列挙する。
+# 気象の one-hot 列 (weather_*) はデータ依存で数が変わるため、
+# 実行時に `FEATURE_COLS + [c for c in df.columns if c.startswith("weather_")]` で足す。
+# ============================================================================
+FEATURE_COLS = [
+    # --- 積載重量(そり) と馬体・パワー ---
+    "sled_weight_num", "sled_weight_change", "sled_weight_zscore",
+    "horse_body_weight", "horse_weight_change", "power_ratio",
+    "horse_body_weight_zscore", "power_ratio_zscore", "sled_weight_diff_max",
+    # --- レース条件・クラス ---
+    "track_moisture_num", "days_since_last_race", "class_level", "class_diff",
+    # --- スピード・勢い ---
+    "horse_avg_speed", "horse_max_speed", "speed_zscore", "momentum_score",
+    # --- 実績エンコーディング(ベイズ平滑化) ---
+    "horse_cum_win_rate", "horse_cum_top3_rate", "pair_top3_rate",
+    "trainer_win_rate", "trainer_top3_rate", "jt_pair_top3_rate",
+    # --- 近走成績・安定度 ---
+    "horse_past_3_avg_rank", "horse_past_5_avg_rank", "horse_rank_std",
+    "horse_past_3_avg_margin", "horse_best_time_sec", "horse_best_time_zscore",
+    # --- 馬場適性(道悪巧者) ---
+    "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
+    # --- 騎手 ---
+    "jockey_win_rate", "jockey_top3_rate",
+    # --- 気象庁 外部データ ---
+    "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
+    "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
+    # --- 物理相互作用・調子・疲労・鞍上 ---
+    "power_moisture_interaction", "sled_weight_moisture_interaction",
+    "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
+    # --- Eloレーティング / 補正タイム指数 ---
+    "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
+    "horse_speed_figure", "horse_speed_figure_zscore",
+    # --- 市場(人気順) ---
+    "popularity_num", "pop_is_fav", "pop_inv", "pop_zscore",
+]
+
+
+def model_feature_cols(df):
+    """FEATURE_COLS に、データに存在する気象one-hot列(weather_*)を加えて返す。"""
+    return FEATURE_COLS + [c for c in df.columns if c.startswith("weather_")]
+
+
 def clean_numeric(val):
     if pd.isna(val):
         return np.nan
@@ -163,7 +207,13 @@ def engineer_features(df):
     df["sled_weight_num"] = df["sled_weight"].apply(clean_numeric)
     df["track_moisture_num"] = df["track_moisture"].apply(clean_numeric)
     df["odds_num"] = df["odds"].apply(clean_numeric)
-    df["popularity_num"] = df["popularity"].apply(clean_numeric)
+    df["popularity_num"] = df["popularity"].apply(clean_numeric).fillna(20.0)  # 欠損=人気薄扱い
+    # 市場(人気順)由来の特徴量。オッズは過去年で欠損するため人気順を市場信号に用いる。
+    df["pop_is_fav"] = (df["popularity_num"] == 1).astype(int)
+    df["pop_inv"] = 1.0 / df["popularity_num"]
+    df["pop_zscore"] = df.groupby("race_id")["popularity_num"].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0
+    )
     df["time_sec"] = df["time"].apply(parse_time_to_seconds)
     df["margin_sec"] = df["margin"].apply(parse_margin_to_seconds)
     df["class_level"] = df["race_name"].apply(extract_class_level)
@@ -328,7 +378,8 @@ def engineer_features(df):
         "power_moisture_interaction", "sled_weight_moisture_interaction",
         "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
         "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
-        "horse_speed_figure", "horse_speed_figure_zscore"
+        "horse_speed_figure", "horse_speed_figure_zscore",
+        "pop_is_fav", "pop_inv", "pop_zscore",
     ]
     weather_cols = list(weather_dummies.columns)
     target_cols = ["is_win", "is_top3", "rank_num", "speed_mps"]

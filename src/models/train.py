@@ -1,114 +1,143 @@
+"""
+ばんえい競馬 着順予測モデルの学習。
+
+このプロジェクトの最終モデルは LightGBM の LambdaRank(ランキング学習)。
+「1レース内で全馬を着順の良い順に並べる」ことを直接最適化するため、
+競馬の競争構造(1レースに勝ち馬は1頭・馬同士は排他)に適合する。
+
+学習の考え方:
+  - 目的変数 relevance = そのレースで打ち負かした頭数 (field_size - 着順)。大きいほど上位。
+  - group  = レースごとの出走頭数。ランカーはこの単位で並べ替えを学習する。
+  - ハイパラは Optuna を「複数シーズンのウォークフォワード」で最適化した値を採用
+    (単一splitへの過学習を避け、未来データでの安定性を担保。--tune で再探索可能)。
+
+使い方:
+  python src/models/train.py            # 既定の最適パラメータで全期間学習し保存
+  python src/models/train.py --tune 40  # Optunaで40試行チューニングしてから学習
+"""
 import os
-import glob
-import pandas as pd
+import sys
+import json
+import argparse
 import numpy as np
+import pandas as pd
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
 import joblib
 
-def main():
-    print("=== STEP 1: 高度特徴量込みのモデル学習スクリプト ===")
-    
-    # 1. 加工済み特徴量データの読み込み
-    data_path = "data/processed/features_train.csv"
-    if not os.path.exists(data_path):
-        print(f"エラー: 学習用特徴量データ {data_path} が見つかりません。")
-        return
-        
-    df = pd.read_csv(data_path)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "features"))
+from build_features import model_feature_cols  # noqa: E402
+
+DATA_PATH = "data/processed/features_train.csv"
+MODEL_PATH = "models/banei_ranker.pkl"
+FEATURES_PATH = "models/banei_ranker_features.pkl"
+PARAMS_PATH = "models/banei_ranker_params.json"
+
+# Optuna×ウォークフォワードで得た最適パラメータ(浅い木×強正則化で過学習を抑制)。
+BEST_PARAMS = {
+    "n_estimators": 800,
+    "learning_rate": 0.0057,
+    "num_leaves": 86,
+    "min_child_samples": 114,
+    "subsample": 0.89,
+    "colsample_bytree": 0.95,
+    "reg_alpha": 1.007,
+    "reg_lambda": 0.085,
+    "max_depth": 3,
+    "subsample_freq": 1,
+}
+
+# ウォークフォワード検証の区切り(学習は各年より前、検証はその年)。
+WALK_FORWARD_YEARS = [2024, 2025, 2026]
+
+
+def load_dataset():
+    """特徴量CSVを読み、ランキング学習用のラベルとメタ列を付けて返す。"""
+    df = pd.read_csv(DATA_PATH)
     df["date"] = pd.to_datetime(df["date"])
-    print(f"データ読み込み完了: 全 {len(df)} 件")
-    
-    # 2. STEP 1 高度特徴量セットの設定
-    feature_cols = [
-        "sled_weight_num",           # そり重量(kg)
-        "horse_body_weight",         # 馬体重(kg)
-        "horse_weight_change",       # 馬体重増減(kg)
-        "power_ratio",               # パワー負荷率
-        # --- STEP 1 追加特徴量 ---
-        "horse_body_weight_zscore",  # [新] レース内馬体重偏差値
-        "power_ratio_zscore",        # [新] レース内パワー率偏差値
-        "sled_weight_diff_max",      # [新] レース内最重量馬との斤量差
-        "track_moisture_num",        # 馬場水分量(%)
-        "horse_past_3_avg_rank",     # 直近3走の平均着順
-        "horse_past_5_avg_rank",     # [新] 直近5走の平均着順
-        "horse_rank_std",            # [新] 着順のばらつき（安定性）
-        "horse_dry_avg_rank",        # [新] 重馬場（乾燥）での平均着順
-        "horse_wet_avg_rank",        # [新] 軽馬場（泥）での平均着順
-        "jockey_win_rate",           # 騎手通算勝率
-        "jockey_top3_rate"           # 騎手通算3着内率
-    ]
-    
-    # 天候One-Hotフラグ
-    weather_cols = [c for c in df.columns if c.startswith("weather_")]
-    feature_cols.extend(weather_cols)
-    
-    target_col = "is_top3"
-    
-    print(f"\n使用する特徴量数: {len(feature_cols)} 個")
-    
-    # 3. 時系列分割（Time Series Split）
-    split_date = "2026-01-01"
-    train_df = df[df["date"] < split_date].copy()
-    test_df = df[df["date"] >= split_date].copy()
-    
-    print(f" - 学習データ: {len(train_df)} 件")
-    print(f" - 検証データ (2026年): {len(test_df)} 件")
-    
-    X_train = train_df[feature_cols]
-    y_train = train_df[target_col]
-    X_test = test_df[feature_cols]
-    y_test = test_df[target_col]
-    
-    # 4. LightGBM モデル学習
-    params = {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "boosting_type": "gbdt",
-        "learning_rate": 0.03,        # 慎重に最適化
-        "num_leaves": 45,             # 表現力を強化
-        "min_child_samples": 20,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "random_state": 42,
-        "verbose": -1
-    }
-    
-    model = lgb.LGBMClassifier(**params, n_estimators=500)
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        callbacks=[lgb.early_stopping(stopping_rounds=40, verbose=False)]
+    df["race_id"] = df["race_id"].astype(str)
+    df = df.dropna(subset=["rank_num"]).copy()
+    feats = model_feature_cols(df)
+    df[feats] = df[feats].fillna(0)
+    df["field_size"] = df.groupby("race_id")["rank_num"].transform("count")
+    df["relevance"] = (df["field_size"] - df["rank_num"]).clip(lower=0).astype(int)
+    return df, feats
+
+
+def fit_ranker(train_df, feats, params):
+    """レース単位(group)でLambdaRankを学習する。"""
+    train_df = train_df.sort_values("race_id")
+    groups = train_df.groupby("race_id", sort=True).size().values
+    model = lgb.LGBMRanker(
+        objective="lambdarank", metric="ndcg",
+        random_state=42, verbose=-1, n_jobs=-1, **params,
     )
-    
-    # 5. モデル検証
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_pred_proba >= 0.5).astype(int)
-    
-    auc = roc_auc_score(y_test, y_pred_proba)
-    acc = accuracy_score(y_test, y_pred)
-    loss = log_loss(y_test, y_pred_proba)
-    
-    print("\n=== STEP 1 モデル検証結果 (2026年テストデータ) ===")
-    print(f" - ROC-AUC (識別能力): {auc:.4f}  (前回: 0.6190)")
-    print(f" - 正解率 (Accuracy):   {acc:.4f}  (前回: 0.6767)")
-    print(f" - Log Loss (損失):    {loss:.4f}")
-    
-    # 6. 特徴量重要度
-    importance_df = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": model.feature_importances_
-    }).sort_values(by="importance", ascending=False).reset_index(drop=True)
-    
-    print("\n=== STEP 1 特徴量重要度 TOP 10 ===")
-    for idx, row in importance_df.head(10).iterrows():
-        print(f" {idx+1:2d}. {row['feature']:<25} : {row['importance']}")
-        
-    model_dir = "models"
-    os.makedirs(model_dir, exist_ok=True)
-    model_file = os.path.join(model_dir, "banei_top3_model_step1.pkl")
-    joblib.dump(model, model_file)
-    print(f"\nモデル保存完了: {model_file}")
+    model.fit(train_df[feats], train_df["relevance"], group=groups)
+    return model
+
+
+def _top1_accuracy(model, val_df, feats):
+    """検証: レースごとにスコア最上位馬が実際に1着だった割合。"""
+    val_df = val_df.copy()
+    val_df["score"] = model.predict(val_df[feats])
+    hit = total = 0
+    for _, r in val_df.groupby("race_id"):
+        if len(r) < 3:
+            continue
+        total += 1
+        if r.loc[r["score"].idxmax(), "umaban"] == r.loc[r["rank_num"].idxmin(), "umaban"]:
+            hit += 1
+    return hit / total * 100 if total else 0.0
+
+
+def walk_forward_tune(df, feats, n_trials):
+    """複数シーズンのウォークフォワードで平均top-1的中率を最大化する(Optuna)。"""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    folds = [(df[df["date"].dt.year < y], df[df["date"].dt.year == y]) for y in WALK_FORWARD_YEARS]
+
+    def objective(trial):
+        params = dict(
+            n_estimators=trial.suggest_int("n_estimators", 300, 1400, step=100),
+            learning_rate=trial.suggest_float("learning_rate", 0.005, 0.08, log=True),
+            num_leaves=trial.suggest_int("num_leaves", 15, 127),
+            min_child_samples=trial.suggest_int("min_child_samples", 10, 120),
+            subsample=trial.suggest_float("subsample", 0.6, 1.0), subsample_freq=1,
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            max_depth=trial.suggest_int("max_depth", 3, 14),
+        )
+        return float(np.mean([_top1_accuracy(fit_ranker(tr, feats, params), va, feats)
+                              for tr, va in folds]))
+
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    print(f"チューニング完了: 平均top1 {study.best_value:.2f}%")
+    best = study.best_params
+    best["subsample_freq"] = 1
+    return best
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ばんえい着順予測 LambdaRank 学習")
+    ap.add_argument("--tune", type=int, default=0, metavar="N",
+                    help="Optunaの試行回数(0=既定パラメータを使用)")
+    args = ap.parse_args()
+
+    df, feats = load_dataset()
+    print(f"データ: {len(df)} 出走 / {df['race_id'].nunique()} レース / 特徴量 {len(feats)} 次元")
+
+    params = walk_forward_tune(df, feats, args.tune) if args.tune > 0 else dict(BEST_PARAMS)
+    print(f"使用パラメータ: {json.dumps(params, ensure_ascii=False)}")
+
+    model = fit_ranker(df, feats, params)  # 全期間で最終学習
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(feats, FEATURES_PATH)
+    json.dump(params, open(PARAMS_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print(f"保存完了: {MODEL_PATH}")
+
 
 if __name__ == "__main__":
     main()
