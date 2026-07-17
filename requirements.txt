@@ -3,6 +3,8 @@ pandas
 numpy
 scikit-learn
 lightgbm
+optuna
+joblib
 
 # スクレイピング・通信
 requests
