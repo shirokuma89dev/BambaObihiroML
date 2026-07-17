@@ -100,6 +100,10 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     df["horse_weight_change"] = [t[1] for t in hw_tuples]
     df["power_ratio"] = df["sled_weight_num"] / df["horse_body_weight"]
     
+    # 馬場水分との物理的相互作用特徴量
+    df["power_moisture_interaction"] = df["power_ratio"] * df["track_moisture_num"]
+    df["sled_weight_moisture_interaction"] = df["sled_weight_num"] * df["track_moisture_num"]
+    
     # スピード (m/s) ばんえいは200m
     df["speed_mps"] = 200.0 / (df["time_sec"] + 1e-6)
     
@@ -149,6 +153,10 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     df["jockey_win_rate"] = df.groupby("jockey_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
     df["jockey_top3_rate"] = df.groupby("jockey_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
     
+    # 乗り替わり勝負度合い (現在の騎手勝率 - 前走の騎手勝率)
+    df["prev_jockey_win_rate"] = df.groupby("horse_name")["jockey_win_rate"].shift(1).fillna(GLOBAL_WIN_RATE)
+    df["jockey_upgrade_factor"] = df["jockey_win_rate"] - df["prev_jockey_win_rate"]
+    
     # 調教師
     df["trainer_win_rate"] = df.groupby("trainer_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
     df["trainer_top3_rate"] = df.groupby("trainer_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
@@ -176,7 +184,19 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     # モメンタム（前走と前々走の着順差: マイナスなら着順良化＝勢いあり）
     df["prev_rank"] = df.groupby("horse_name")["rank_num"].shift(1)
     df["prev_prev_rank"] = df.groupby("horse_name")["rank_num"].shift(2)
+    df["prev_prev_prev_rank"] = df.groupby("horse_name")["rank_num"].shift(3)
     df["momentum_score"] = (df["prev_rank"] - df["prev_prev_rank"]).fillna(0)
+    
+    # 近走調子スコア (加重順位平均: 直近に近いほど比重重め)
+    df["recent_form_score"] = (
+        df["prev_rank"].fillna(5.0) * 0.5 +
+        df["prev_prev_rank"].fillna(5.0) * 0.3 +
+        df["prev_prev_prev_rank"].fillna(5.0) * 0.2
+    ).fillna(5.0)
+    
+    # 疲労インデックス (体重変化量 / レース間隔日数)
+    # 体重が減っているのにレース間隔が短いほど、疲労度が大きく（マイナスに）なる
+    df["fatigue_index"] = (df["horse_weight_change"] / (df["days_since_last_race"] + 1.0)).fillna(0)
     
     df["horse_past_3_avg_rank"] = df.groupby("horse_name")["rank_num"].transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
     df["horse_past_5_avg_rank"] = df.groupby("horse_name")["rank_num"].transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
@@ -201,7 +221,7 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
     
     df["track_specialist_factor"] = (df["horse_wet_avg_rank"] - df["horse_dry_avg_rank"]).fillna(0)
     
-    # 最終的な特徴量群 (全 45 次元 + 気象庁データ)
+    # 最終的な特徴量群 (全 45 次元 + 気象庁データ + 馬場水分相互作用 + 調子・疲労・鞍上)
     base_cols = [
         "race_id", "date", "race_no", "race_name", "umaban", "waku",
         "horse_name", "sex_age", "jockey_name", "trainer_name", "weather",
@@ -218,7 +238,9 @@ def process_raw_data(data_dir="data/raw", out_dir="data/processed"):
         "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
         "jockey_win_rate", "jockey_top3_rate",
         "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
-        "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm"
+        "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
+        "power_moisture_interaction", "sled_weight_moisture_interaction",
+        "jockey_upgrade_factor", "recent_form_score", "fatigue_index"
     ]
     weather_cols = list(weather_dummies.columns)
     target_cols = ["is_win", "is_top3", "rank_num", "speed_mps"]

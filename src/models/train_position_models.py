@@ -39,7 +39,9 @@ def main():
         "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
         "jockey_win_rate", "jockey_top3_rate",
         "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
-        "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm"
+        "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
+        "power_moisture_interaction", "sled_weight_moisture_interaction",
+        "jockey_upgrade_factor", "recent_form_score", "fatigue_index"
     ]
     weather_cols = [c for c in df.columns if c.startswith("weather_")]
     feature_cols.extend(weather_cols)
