@@ -71,31 +71,44 @@ def fetch_race_card(session, date_str, race_no, meta_info):
         rows = []
         
         # DebaTable から出走情報抽出
+        current_horse = None
+        last_waku = ""
         for table in tables:
             for tr in table.find_all("tr"):
                 tds = [td.get_text(strip=True) for td in tr.find_all(["th", "td"])]
-                if len(tds) >= 4 and tds[0].isdigit() and tds[1].isdigit():
-                    waku = tds[0]
-                    umaban = tds[1]
-                    horse_name = tds[2]
-                    jockey_info = tds[3] if len(tds) > 3 else ""
+                if len(tds) >= 3 and tds[0].isdigit():
+                    # 前の馬のデータを保存
+                    if current_horse is not None:
+                        rows.append(current_horse)
                     
-                    sled_weight = ""
-                    horse_weight_text = ""
+                    if len(tds) >= 4 and tds[1].isdigit():
+                        # Case A: waku と umaban が両方存在
+                        waku = tds[0]
+                        umaban = tds[1]
+                        horse_name = tds[2]
+                        jockey_info = tds[3]
+                        odds_pop_text = tds[4] if len(tds) > 4 else ""
+                        last_waku = waku
+                    else:
+                        # Case B: waku が省略され、tds[0] が umaban
+                        waku = last_waku
+                        umaban = tds[0]
+                        horse_name = tds[1]
+                        jockey_info = tds[2] if len(tds) > 2 else ""
+                        odds_pop_text = tds[3] if len(tds) > 3 else ""
+                    
+                    # オッズと人気順をパース
                     odds_text = ""
                     popularity_text = ""
-                    
-                    for text in tds[4:]:
-                        if re.search(r"^\d{3,4}$", text) and not sled_weight:
-                            sled_weight = text
-                        elif re.search(r"\d{3,4}\([+-]?\d+\)", text):
-                            horse_weight_text = text
-                        elif re.match(r"^\d+\.\d+$", text):
-                            odds_text = text
-                        elif "人気" in text:
-                            popularity_text = text.replace("人気", "")
+                    if odds_pop_text:
+                        m_odds = re.search(r"([\d.]+)", odds_pop_text)
+                        if m_odds:
+                            odds_text = m_odds.group(1)
+                        m_pop = re.search(r"\((\d+)人気\)", odds_pop_text)
+                        if m_pop:
+                            popularity_text = m_pop.group(1)
                             
-                    rows.append({
+                    current_horse = {
                         "race_id": race_id,
                         "date": meta_info["date"],
                         "race_no": race_no,
@@ -106,12 +119,28 @@ def fetch_race_card(session, date_str, race_no, meta_info):
                         "waku": waku,
                         "umaban": umaban,
                         "horse_name": horse_name,
-                        "sled_weight": sled_weight,
+                        "sled_weight": "",
                         "jockey_name": jockey_info,
-                        "horse_weight": horse_weight_text,
+                        "horse_weight": "",
                         "odds": odds_text,
                         "popularity": popularity_text
-                    })
+                    }
+                elif current_horse is not None:
+                    # サブ行からソリ重量と馬体重を抽出
+                    # ソリ重量 (例: "☆ 460　0-0-0-0") は index 3 に配置（減量マーク対応で先頭マッチを外す）
+                    if len(tds) >= 4:
+                        m_sled = re.search(r"(\d{3,4})(?:\s|　)*\d+-\d+-\d+-\d+", tds[3])
+                        if m_sled:
+                            current_horse["sled_weight"] = m_sled.group(1)
+                    # パドック馬体重 (例: "1061(+26)" または増減なし "852") は index 2 に配置
+                    if len(tds) >= 3:
+                        m_hw = re.search(r"\d{3,4}(?:\([+-]?\d+\))?", tds[2])
+                        if m_hw:
+                            current_horse["horse_weight"] = m_hw.group(0)
+                            
+        # 最後の馬を保存
+        if current_horse is not None:
+            rows.append(current_horse)
                     
         return pd.DataFrame(rows)
     except Exception as e:

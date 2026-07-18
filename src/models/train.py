@@ -34,14 +34,14 @@ PARAMS_PATH = "models/banei_ranker_params.json"
 
 # Optuna×ウォークフォワードで得た最適パラメータ(浅い木×強正則化で過学習を抑制)。
 BEST_PARAMS = {
-    "n_estimators": 800,
-    "learning_rate": 0.0057,
-    "num_leaves": 86,
-    "min_child_samples": 114,
-    "subsample": 0.89,
-    "colsample_bytree": 0.95,
-    "reg_alpha": 1.007,
-    "reg_lambda": 0.085,
+    "n_estimators": 300,
+    "learning_rate": 0.00965377328885368,
+    "num_leaves": 45,
+    "min_child_samples": 38,
+    "subsample": 0.8915046079722405,
+    "colsample_bytree": 0.7396752184286884,
+    "reg_alpha": 2.7698623616220774,
+    "reg_lambda": 4.4317860991437215,
     "max_depth": 3,
     "subsample_freq": 1,
 }
@@ -97,15 +97,15 @@ def walk_forward_tune(df, feats, n_trials):
 
     def objective(trial):
         params = dict(
-            n_estimators=trial.suggest_int("n_estimators", 300, 1400, step=100),
-            learning_rate=trial.suggest_float("learning_rate", 0.005, 0.08, log=True),
-            num_leaves=trial.suggest_int("num_leaves", 15, 127),
-            min_child_samples=trial.suggest_int("min_child_samples", 10, 120),
-            subsample=trial.suggest_float("subsample", 0.6, 1.0), subsample_freq=1,
-            colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            reg_alpha=trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
-            reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
-            max_depth=trial.suggest_int("max_depth", 3, 14),
+            n_estimators=trial.suggest_int("n_estimators", 300, 1500, step=100),
+            learning_rate=trial.suggest_float("learning_rate", 0.003, 0.05, log=True),
+            num_leaves=trial.suggest_int("num_leaves", 15, 63),
+            min_child_samples=trial.suggest_int("min_child_samples", 30, 150),
+            subsample=trial.suggest_float("subsample", 0.7, 1.0), subsample_freq=1,
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 0.9),
+            reg_alpha=trial.suggest_float("reg_alpha", 1e-2, 20.0, log=True),
+            reg_lambda=trial.suggest_float("reg_lambda", 1e-2, 20.0, log=True),
+            max_depth=trial.suggest_int("max_depth", 3, 6),
         )
         return float(np.mean([_top1_accuracy(fit_ranker(tr, feats, params), va, feats)
                               for tr, va in folds]))

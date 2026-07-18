@@ -2,8 +2,11 @@ import argparse
 import glob
 import os
 import re
+import warnings
 import pandas as pd
 import numpy as np
+
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
 # ============================================================================
 # モデルが使用する特徴量の正規リスト。
@@ -26,10 +29,12 @@ FEATURE_COLS = [
     # --- 近走成績・安定度 ---
     "horse_past_3_avg_rank", "horse_past_5_avg_rank", "horse_rank_std",
     "horse_past_3_avg_margin", "horse_best_time_sec", "horse_best_time_zscore",
+    "horse_ewm_speed", "horse_ewm_speed_zscore",
     # --- 馬場適性(道悪巧者) ---
     "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
+    "horse_moisture_speed_sensitivity",
     # --- 騎手 ---
-    "jockey_win_rate", "jockey_top3_rate",
+    "jockey_win_rate", "jockey_top3_rate", "jockey_ewm_win_rate", "jockey_ewm_top3_rate",
     # --- 気象庁 外部データ ---
     "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
     "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
@@ -37,11 +42,21 @@ FEATURE_COLS = [
     "power_moisture_interaction", "sled_weight_moisture_interaction",
     "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
     "sled_weight_relief", "jockey_moisture_specialist",
+    "horse_weight_change_pct", "speed_acceleration", "class_level_exp", "jockey_class_top3_rate",
+    "horse_class_win_rate", "horse_class_top3_rate",
+    # --- 凍結馬場物理・氷結巧者 ---
+    "is_freezing_temp", "freezing_ice_friction", "snow_ice_moisture_interaction",
+    "horse_freezing_avg_rank", "horse_nonfreezing_avg_rank", "freezing_specialist_factor",
+    # --- 夏競馬(8月現地)特化物理・猛暑乾燥・夏バテ ---
+    "is_summer_season", "summer_heat_stress", "summer_heat_fatigue", "sand_drying_index",
+    "horse_summer_avg_rank", "horse_winter_avg_rank", "summer_specialist_factor",
     # --- Eloレーティング / 補正タイム指数 ---
     "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
     "horse_speed_figure", "horse_speed_figure_zscore",
     # --- 市場(人気順) ---
     "popularity_num", "pop_is_fav", "pop_inv", "pop_zscore",
+    # --- 血統ターゲットエンコーディング ---
+    "sire_win_rate", "sire_top3_rate", "dam_sire_win_rate", "dam_sire_top3_rate", "dam_win_rate", "dam_top3_rate",
 ]
 
 
@@ -200,6 +215,20 @@ def engineer_features(df):
     「そのレース開始前」の値(Elo/累積勝率/タイム指数等)を正しく受け取る。"""
     print(f"--- 特徴量エンジニアリング: 全 {len(df)} 件 ---")
 
+    # 血統データのロードとマージ
+    ped_path = "data/processed/pedigree_map.csv"
+    if os.path.exists(ped_path):
+        ped_df = pd.read_csv(ped_path)
+        df = df.drop(columns=["sire", "dam", "dam_sire"], errors="ignore")
+        df = df.merge(ped_df, on="horse_name", how="left")
+    else:
+        df["sire"] = np.nan
+        df["dam"] = np.nan
+        df["dam_sire"] = np.nan
+    df["sire"] = df["sire"].fillna("unknown")
+    df["dam"] = df["dam"].fillna("unknown")
+    df["dam_sire"] = df["dam_sire"].fillna("unknown")
+
     # 1. 基本パース
     df["rank_num"] = df["rank"].apply(clean_numeric)
     df["is_win"] = (df["rank_num"] == 1).astype(int)
@@ -276,6 +305,8 @@ def engineer_features(df):
     # 騎手
     df["jockey_win_rate"] = df.groupby("jockey_name")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
     df["jockey_top3_rate"] = df.groupby("jockey_name")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
+    df["jockey_ewm_win_rate"] = df.groupby("jockey_name")["is_win"].transform(lambda s: s.shift(1).ewm(span=15, min_periods=1).mean()).fillna(GLOBAL_WIN_RATE)
+    df["jockey_ewm_top3_rate"] = df.groupby("jockey_name")["is_top3"].transform(lambda s: s.shift(1).ewm(span=15, min_periods=1).mean()).fillna(GLOBAL_TOP3_RATE)
     
     # 乗り替わり勝負度合い (現在の騎手勝率 - 前走の騎手勝率)
     df["prev_jockey_win_rate"] = df.groupby("horse_name")["jockey_win_rate"].shift(1).fillna(GLOBAL_WIN_RATE)
@@ -293,6 +324,21 @@ def engineer_features(df):
     df["jockey_trainer_pair"] = df["jockey_name"].astype(str) + "_" + df["trainer_name"].astype(str)
     df["jt_pair_top3_rate"] = df.groupby("jockey_trainer_pair")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=10))
     
+    df["jockey_class_pair"] = df["jockey_name"].astype(str) + "_C" + df["class_level"].astype(str)
+    df["jockey_class_top3_rate"] = df.groupby("jockey_class_pair")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=5))
+    
+    df["horse_class_pair"] = df["horse_name"].astype(str) + "_C" + df["class_level"].astype(str)
+    df["horse_class_win_rate"] = df.groupby("horse_class_pair")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=5))
+    df["horse_class_top3_rate"] = df.groupby("horse_class_pair")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=5))
+
+    # 血統ターゲットエンコーディング
+    df["sire_win_rate"] = df.groupby("sire")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
+    df["sire_top3_rate"] = df.groupby("sire")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
+    df["dam_sire_win_rate"] = df.groupby("dam_sire")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=15))
+    df["dam_sire_top3_rate"] = df.groupby("dam_sire")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=15))
+    df["dam_win_rate"] = df.groupby("dam")["is_win"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_WIN_RATE, prior_weight=3))
+    df["dam_top3_rate"] = df.groupby("dam")["is_top3"].transform(lambda s: bayesian_target_encoding(s, prior_mean=GLOBAL_TOP3_RATE, prior_weight=3))
+    
     # 4. スピード＆モメンタム (勢い)
     print("スピード指標・モメンタム・道悪巧者インデックスを生成中...")
     df["prev_sled_weight"] = df.groupby("horse_name")["sled_weight_num"].shift(1)
@@ -307,6 +353,15 @@ def engineer_features(df):
     df["horse_avg_speed"] = df.groupby("horse_name")["speed_mps"].transform(lambda s: s.shift(1).expanding(min_periods=1).mean()).fillna(1.5)
     df["horse_max_speed"] = df.groupby("horse_name")["speed_mps"].transform(lambda s: s.shift(1).cummax()).fillna(1.5)
     df["speed_zscore"] = df.groupby("race_id")["horse_avg_speed"].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0)
+    
+    # EWM 直近スピード実績
+    df["horse_ewm_speed"] = df.groupby("horse_name")["speed_mps"].transform(lambda s: s.shift(1).ewm(span=5, min_periods=1).mean()).fillna(1.5)
+    df["horse_ewm_speed_zscore"] = df.groupby("race_id")["horse_ewm_speed"].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0)
+    
+    # スピード加速度（前走スピード - 前々走スピード）
+    df["prev_speed"] = df.groupby("horse_name")["speed_mps"].shift(1)
+    df["prev_prev_speed"] = df.groupby("horse_name")["speed_mps"].shift(2)
+    df["speed_acceleration"] = (df["prev_speed"] - df["prev_prev_speed"]).fillna(0)
     
     # モメンタム（前走と前々走の着順差: マイナスなら着順良化＝勢いあり）
     df["prev_rank"] = df.groupby("horse_name")["rank_num"].shift(1)
@@ -332,6 +387,8 @@ def engineer_features(df):
     
     df["prev_class_level"] = df.groupby("horse_name")["class_level"].shift(1)
     df["class_diff"] = (df["class_level"] - df["prev_class_level"]).fillna(0)
+    df["class_level_exp"] = df.groupby("horse_name")["class_level"].transform(lambda s: s.shift(1).expanding().mean()).fillna(0)
+    df["horse_weight_change_pct"] = (df["horse_weight_change"] / (df["horse_body_weight"] + 1e-6)).fillna(0)
     
     df["horse_best_time_sec"] = df.groupby("horse_name")["time_sec"].transform(lambda s: s.shift(1).cummin())
     df["horse_best_time_zscore"] = df.groupby("race_id")["horse_best_time_sec"].transform(lambda x: (x - x.mean()) / (x.std() + 1e-6) if len(x) > 1 else 0)
@@ -347,6 +404,43 @@ def engineer_features(df):
     df["horse_wet_avg_rank"] = df.groupby("horse_name")["wet_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
     
     df["track_specialist_factor"] = (df["horse_wet_avg_rank"] - df["horse_dry_avg_rank"]).fillna(0)
+    
+    df["dry_speed_val"] = np.where(dry_mask, df["speed_mps"], np.nan)
+    df["horse_dry_avg_speed"] = df.groupby("horse_name")["dry_speed_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    df["wet_speed_val"] = np.where(~dry_mask, df["speed_mps"], np.nan)
+    df["horse_wet_avg_speed"] = df.groupby("horse_name")["wet_speed_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    df["horse_moisture_speed_sensitivity"] = (df["horse_wet_avg_speed"] - df["horse_dry_avg_speed"]).fillna(0)
+
+    # 凍結馬場物理・氷結巧者インデックス
+    df["is_freezing_temp"] = (df["temp_min_c"].fillna(10.0) <= 0.0).astype(int)
+    df["freezing_ice_friction"] = df["is_freezing_temp"] * df["track_moisture_num"] * df["power_ratio"]
+    df["snow_ice_moisture_interaction"] = (df["snow_depth_cm"].fillna(0) + 1.0) * df["track_moisture_num"] * df["is_freezing_temp"]
+    
+    freezing_mask = df["is_freezing_temp"] == 1
+    df["freezing_rank_val"] = np.where(freezing_mask, df["rank_num"], np.nan)
+    df["horse_freezing_avg_rank"] = df.groupby("horse_name")["freezing_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    nonfreezing_mask = df["is_freezing_temp"] == 0
+    df["nonfreezing_rank_val"] = np.where(nonfreezing_mask, df["rank_num"], np.nan)
+    df["horse_nonfreezing_avg_rank"] = df.groupby("horse_name")["nonfreezing_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    df["freezing_specialist_factor"] = (df["horse_freezing_avg_rank"] - df["horse_nonfreezing_avg_rank"]).fillna(0)
+
+    # 夏競馬(8月現地)特化物理・猛暑乾燥・夏バテ・夏馬巧者インデックス
+    df["is_summer_season"] = ((df["date"].dt.month >= 6) & (df["date"].dt.month <= 9)).astype(int)
+    df["summer_heat_stress"] = (df["temp_max_c"].fillna(20.0) / (df["track_moisture_num"] + 0.1)) * df["power_ratio"]
+    df["summer_heat_fatigue"] = (df["horse_weight_change"] * (df["temp_max_c"].fillna(20.0) > 25.0).astype(int)).fillna(0)
+    df["sand_drying_index"] = (df["sunlight_hours"].fillna(0) * df["temp_max_c"].fillna(20.0) / (df["humidity_avg_pct"].fillna(50.0) + 1.0))
+    
+    summer_mask = df["is_summer_season"] == 1
+    df["summer_rank_val"] = np.where(summer_mask, df["rank_num"], np.nan)
+    df["horse_summer_avg_rank"] = df.groupby("horse_name")["summer_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    winter_mask = df["is_summer_season"] == 0
+    df["winter_rank_val"] = np.where(winter_mask, df["rank_num"], np.nan)
+    df["horse_winter_avg_rank"] = df.groupby("horse_name")["winter_rank_val"].transform(lambda s: s.shift(1).ffill().rolling(3, min_periods=1).mean())
+    
+    df["summer_specialist_factor"] = (df["horse_summer_avg_rank"] - df["horse_winter_avg_rank"]).fillna(0)
 
     # 5. Eloレーティング (対戦相手の強さを織り込む動的能力指標)
     print("馬・騎手のEloレーティングを時系列更新中...")
@@ -375,16 +469,25 @@ def engineer_features(df):
         "trainer_win_rate", "trainer_top3_rate", "jt_pair_top3_rate",
         "horse_past_3_avg_rank", "horse_past_5_avg_rank", "horse_rank_std",
         "horse_past_3_avg_margin", "horse_best_time_sec", "horse_best_time_zscore",
+        "horse_ewm_speed", "horse_ewm_speed_zscore",
         "horse_dry_avg_rank", "horse_wet_avg_rank", "track_specialist_factor",
-        "jockey_win_rate", "jockey_top3_rate",
+        "horse_moisture_speed_sensitivity",
+        "jockey_win_rate", "jockey_top3_rate", "jockey_ewm_win_rate", "jockey_ewm_top3_rate",
         "precip_total_mm", "temp_avg_c", "temp_max_c", "temp_min_c",
         "humidity_avg_pct", "wind_avg_mps", "sunlight_hours", "snowfall_cm", "snow_depth_cm",
         "power_moisture_interaction", "sled_weight_moisture_interaction",
         "jockey_upgrade_factor", "recent_form_score", "fatigue_index",
         "sled_weight_relief", "jockey_moisture_specialist",
+        "horse_weight_change_pct", "speed_acceleration", "class_level_exp", "jockey_class_top3_rate",
+        "horse_class_win_rate", "horse_class_top3_rate",
+        "is_freezing_temp", "freezing_ice_friction", "snow_ice_moisture_interaction",
+        "horse_freezing_avg_rank", "horse_nonfreezing_avg_rank", "freezing_specialist_factor",
+        "is_summer_season", "summer_heat_stress", "summer_heat_fatigue", "sand_drying_index",
+        "horse_summer_avg_rank", "horse_winter_avg_rank", "summer_specialist_factor",
         "horse_elo_pre", "jockey_elo_pre", "horse_elo_zscore", "elo_gap_to_top",
         "horse_speed_figure", "horse_speed_figure_zscore",
         "pop_is_fav", "pop_inv", "pop_zscore",
+        "sire_win_rate", "sire_top3_rate", "dam_sire_win_rate", "dam_sire_top3_rate", "dam_win_rate", "dam_top3_rate",
     ]
     weather_cols = list(weather_dummies.columns)
     target_cols = ["is_win", "is_top3", "rank_num", "speed_mps"]

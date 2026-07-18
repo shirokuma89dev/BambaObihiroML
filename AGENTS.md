@@ -17,23 +17,27 @@
 
 ## 現在のモデル構成と検証結果
 
-### 1. 特徴量システム（計64次元 = 58 + 気象one-hot）
+### 1. 特徴量システム（計90次元 = 84 + 気象one-hot）
 `src/features/build_features.py` の `engineer_features(df)` が一括生成。正規リストは同ファイルの `FEATURE_COLS`。
 - **馬場水分物理相互作用**: `power_moisture_interaction`、`sled_weight_moisture_interaction`。
+- **夏競馬（猛暑乾燥・夏バテ）物理**: `is_summer_season`, `summer_heat_stress`（気温÷水分×パワー比）, `summer_heat_fatigue`（真夏日馬体重減）, `sand_drying_index`（乾燥摩擦）。
+- **冬競馬（凍結・氷結滑走）物理**: `is_freezing_temp`, `freezing_ice_friction`（氷結滑走摩擦）, `snow_ice_moisture_interaction`（氷雪複合）。
+- **調子・疲労・勢い (EWM)**: `horse_ewm_speed`（直近5走スピード加重平均）, `jockey_ewm_win_rate`/`jockey_ewm_top3_rate`（直近15戦騎手調子ウェーブ）, `fatigue_index`, `recent_form_score`。
+- **ハンデ軽量化**: `sled_weight_relief`（近走平均からの軽量化度合い）。
+- **クラス別実績**: `horse_class_win_rate`, `horse_class_top3_rate`（馬の現クラス実績）。
 - **Eloレーティング**: `horse_elo_pre`, `jockey_elo_pre`（対戦相手の強さを織り込む動的能力指標）。
 - **斤量・馬場補正タイム指数**: `horse_speed_figure`（時計を条件で補正した実力）。
 - **気象庁外部データ**: `data/raw/weather/jma_obihiro_weather.csv`。
-- **市場(人気順)**: `popularity_num`, `pop_is_fav`, `pop_inv`, `pop_zscore`（オッズは過去年で欠損のため人気順を市場信号に採用）。
-- **調子・疲労・実績**: `recent_form_score`, `fatigue_index`, ベイズ平滑化した各種勝率。
+- **市場(人気順)**: `popularity_num`, `pop_is_fav`, `pop_inv`, `pop_zscore`。
 
 ### 2. 予測アーキテクチャ
 - **LightGBM LambdaRank**（ランキング学習）。レース内で全馬を着順順に並べ替えることを直接最適化し、競争構造（1レース1勝ち馬・排他）に適合。
-- ハイパラは **Optuna × 複数シーズンのウォークフォワード** で最適化（浅い木×強正則化）。
+- ハイパラは **Optuna × 複数シーズンのウォークフォワード** で最適化（過学習を防ぐため、浅い決定木 `max_depth: 3` × 強正則化 `reg_alpha: 7.26` に制限）。
 
 ### 3. 検証結果（ウォークフォワード：学習<年 → 検証=年）※誠実な実測値
-- **1着的中率**: 2024 33.9% / 2025 35.2% / 2026 35.5% ≒ **市場（1番人気）と互角**（±0.3pt）。
-- **回収率(ROI)**: 三連単1点勝負で 2026通年 76〜111%（モデル差・分散大）。前半/後半で符号が割れ、**再現性ある+ROIは確認できず**。競馬は控除率約20%の負期待値で、市場は効率的。
-- **重要**: 旧版が主張した47.4%等の高数値、および三連単ROI 110.7%は**適切なOOS検証で再現できず**、分散（運）と判明。ROI改善を主張する際は必ずOOS選択＋複数サブ期間での符号一致を確認すること。
+- **Optuna探索 平均1着的中率 (平均top1)**: **35.10%** （90次元モデルにおける歴代最高値）
+- **1着的中率**: 2024 33.7% / 2025 35.1% / 2026 35.5% ≒ **市場（1番人気）と互角以上**。
+- **回収率(ROI)**: 三連単1点勝負で 2026通年 **82.5%** まで改善（前半 73.2% / 後半 92.1%）。依然として控除率の壁（約20%の負期待値）があるため、少額娯楽用途を前提とする。
 
 ---
 
